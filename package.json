@@ -1,0 +1,30 @@
+{
+	"name": "copilot-studio-mcp-shim",
+	"version": "0.1.0",
+	"description": "Connect Microsoft Copilot Studio to an Arcade MCP gateway that has a user source, while Copilot is catching up on the MCP spec.",
+	"private": true,
+	"type": "module",
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"start": "node dist/runtimes/node.js",
+		"start:bun": "bun src/runtimes/bun.ts",
+		"dev": "bun --watch src/runtimes/bun.ts",
+		"typecheck": "tsc -p .",
+		"test": "bun test",
+		"check": "biome check src api && tsc -p ."
+	},
+	"dependencies": {
+		"@hono/node-server": "^1.19.0",
+		"@vercel/functions": "^3.0.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.15",
+		"@cloudflare/workers-types": "^4.20260101.0",
+		"@types/bun": "^1.3.0",
+		"@types/node": "^24.0.0",
+		"typescript": "^5.9.0"
+	}
+}

@@ -1,0 +1,8 @@
+name = "copilot-studio-mcp-shim"
+main = "src/runtimes/cloudflare.ts"
+compatibility_date = "2026-10-01"
+
+[vars]
+# Set these for your deployment (or with `wrangler secret put` / the dashboard).
+SHIM_PUBLIC_URL = "https://copilot-studio-mcp-shim.example.workers.dev"
+SHIM_GATEWAY = "my-gateway"

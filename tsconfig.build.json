@@ -1,0 +1,16 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"noEmit": false,
+		"allowImportingTsExtensions": false,
+		"outDir": "dist",
+		"rootDir": "src",
+		"types": ["node"]
+	},
+	"include": ["src"],
+	"exclude": [
+		"src/**/*.test.ts",
+		"src/runtimes/bun.ts",
+		"src/runtimes/cloudflare.ts"
+	]
+}
