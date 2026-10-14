@@ -33,6 +33,15 @@ export interface ShimConfig {
 	/** Arcade's OAuth authorization server. Defaults to https://cloud.arcade.dev. */
 	arcadeAuthUrl?: string | undefined;
 	/**
+	 * Hostnames a client may be sent back to after sign-in, each exact or a
+	 * `*.` wildcard (`*.example.com` matches any subdomain, not the apex).
+	 * When set, registration with any other `redirect_uris` host and
+	 * authorize with any other `redirect_uri` host are refused with 400, so a
+	 * sign-in link on the shim's domain can only land at these hosts. When
+	 * unset, anything goes, as on Arcade itself.
+	 */
+	allowedRedirectHosts?: string[] | undefined;
+	/**
 	 * Also log MCP request and response bodies (tool arguments and results) to
 	 * the `log` sink. Off by default: those bodies can hold user data.
 	 */
@@ -173,6 +182,37 @@ export class ShimError extends Error {
 		message: string,
 	) {
 		super(message);
+	}
+}
+
+/** Whether `hostname` matches one of `patterns` (exact, or `*.` wildcard). */
+export function redirectHostAllowed(
+	hostname: string,
+	patterns: string[],
+): boolean {
+	const host = hostname.toLowerCase();
+	return patterns.some((pattern) => {
+		const p = pattern.toLowerCase();
+		return p.startsWith("*.")
+			? host.endsWith(p.slice(1)) && host.length > p.length - 1
+			: host === p;
+	});
+}
+
+/** A 400 unless `uri` is an absolute URL whose host is on the allowlist. */
+function checkRedirectUri(field: string, uri: unknown, allowed: string[]) {
+	if (uri === undefined) throw new ShimError(400, `${field} is required`);
+	if (typeof uri !== "string") {
+		throw new ShimError(400, `${field} must be a URL`);
+	}
+	let url: URL;
+	try {
+		url = new URL(uri);
+	} catch {
+		throw new ShimError(400, `${field} must be a URL`);
+	}
+	if (!redirectHostAllowed(url.hostname, allowed)) {
+		throw new ShimError(400, `${field} host not allowed: ${url.hostname}`);
 	}
 }
 
@@ -384,6 +424,7 @@ export function createShim(config: ShimConfig) {
 	const maxBodyBytes = config.maxBodyBytes ?? 10 * 1024 * 1024;
 	const oauthTimeoutMs = config.oauthTimeoutMs ?? 30_000;
 	const mcpTimeoutMs = config.mcpTimeoutMs ?? 300_000;
+	const allowedRedirectHosts = config.allowedRedirectHosts;
 
 	/** An OAuth call to Arcade, read in full within the OAuth timeout. */
 	async function oauthFetch(
@@ -475,6 +516,17 @@ export function createShim(config: ShimConfig) {
 				new URL(req.url).searchParams.forEach((value, key) => {
 					target.searchParams.append(key, value);
 				});
+				// With an allowlist, a sign-in link on this domain can only
+				// land somewhere on it. One without redirect_uri would land
+				// wherever the client registered (perhaps not through the
+				// shim), so it's refused too.
+				if (allowedRedirectHosts) {
+					checkRedirectUri(
+						"redirect_uri",
+						target.searchParams.get("redirect_uri") ?? undefined,
+						allowedRedirectHosts,
+					);
+				}
 				target.searchParams.set("resource", resource);
 				target.searchParams.set(
 					"scope",
@@ -516,11 +568,27 @@ export function createShim(config: ShimConfig) {
 					},
 					response: { ...pick(answer), ...tokenPresence(answer) },
 				};
-				return passBack(res, text);
+				// A token response must not be cached (RFC 6749 §5.1), whether
+				// or not Arcade said so.
+				const out = passBack(res, text);
+				if (!out.headers.has("cache-control")) {
+					out.headers.set("cache-control", "no-store");
+				}
+				if (!out.headers.has("pragma")) out.headers.set("pragma", "no-cache");
+				return out;
 			}
 
 			case "register": {
 				const body = await readBody(req, MAX_OAUTH_BODY_BYTES);
+				if (allowedRedirectHosts) {
+					const uris = parseJson(body).redirect_uris;
+					if (uris !== undefined && !Array.isArray(uris)) {
+						throw new ShimError(400, "redirect_uris must be an array");
+					}
+					for (const uri of uris ?? []) {
+						checkRedirectUri("redirect_uris", uri, allowedRedirectHosts);
+					}
+				}
 				const { res, text } = await oauthFetch(
 					new Request(`${arcadeAuth}/oauth2/register`, {
 						method: "POST",
