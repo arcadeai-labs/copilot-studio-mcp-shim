@@ -10,6 +10,7 @@ import {
 	createShim,
 	MAX_OAUTH_BODY_BYTES,
 	readBody,
+	redirectHostAllowed,
 	type ShimLog,
 	tokenClaims,
 } from "./shim.ts";
@@ -137,6 +138,24 @@ describe("authorize", () => {
 		expect(location.searchParams.get("scope")).toBe("offline_access mcp");
 	});
 
+	test("passes state, PKCE and redirect_uri through unchanged", async () => {
+		const sent = {
+			state: "st-4f3/2+=",
+			code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+			code_challenge_method: "S256",
+			redirect_uri: "https://global.consent.azure-apim.net/redirect/x?a=1",
+		};
+		const query = new URLSearchParams({ client_id: "c1", ...sent });
+		const res = await call(`/oauth2/authorize?${query}`);
+		expect(res.status).toBe(302);
+		const location = new URL(res.headers.get("location") ?? "");
+		for (const [key, value] of Object.entries(sent)) {
+			expect(location.searchParams.getAll(key)).toEqual([value]);
+		}
+		// The code challenge is not a credential, but the log doesn't need it.
+		expect(JSON.stringify(logs)).not.toContain(sent.code_challenge);
+	});
+
 	test("replaces any other resource, so it can only reach this gateway", async () => {
 		const res = await call(
 			`/oauth2/authorize?client_id=c1&resource=${encodeURIComponent("https://api.arcade.dev/mcp/other")}`,
@@ -158,7 +177,7 @@ describe("token", () => {
 		const res = await call("/oauth2/token", {
 			method: "POST",
 			headers: { "content-type": "application/x-www-form-urlencoded" },
-			body: "grant_type=authorization_code&code=code-secret&code_verifier=v-secret&client_id=c1",
+			body: "grant_type=authorization_code&code=code-secret&code_verifier=v-secret&client_id=c1&redirect_uri=https%3A%2F%2Fcb.test%2Fr%3Fa%3D1",
 		});
 		expect(((await res.json()) as { access_token: string }).access_token).toBe(
 			"at-secret",
@@ -166,6 +185,12 @@ describe("token", () => {
 		const sent = new URLSearchParams(await upstream[0]?.text());
 		expect(sent.get("resource")).toBe(RESOURCE);
 		expect(sent.get("code")).toBe("code-secret");
+		// The verifier and redirect_uri reach Arcade exactly as sent.
+		expect(sent.getAll("code_verifier")).toEqual(["v-secret"]);
+		expect(sent.getAll("redirect_uri")).toEqual(["https://cb.test/r?a=1"]);
+		// Token responses are never cached (RFC 6749 §5.1).
+		expect(res.headers.get("cache-control")).toBe("no-store");
+		expect(res.headers.get("pragma")).toBe("no-cache");
 
 		const logged = JSON.stringify(logs);
 		for (const secret of ["at-secret", "rt-secret", "code-secret", "v-secret"])
@@ -175,6 +200,7 @@ describe("token", () => {
 			request: {
 				grant_type: "authorization_code",
 				client_id: "c1",
+				redirect_uri: "https://cb.test/r?a=1",
 				resource: RESOURCE,
 				has_code: true,
 				has_code_verifier: true,
@@ -186,6 +212,23 @@ describe("token", () => {
 				has_refresh_token: true,
 			},
 		});
+	});
+
+	test("Arcade's own cache headers are kept", async () => {
+		reply = () =>
+			Response.json(
+				{ access_token: "at", token_type: "Bearer" },
+				{
+					headers: { "cache-control": "no-store, private", pragma: "no-cache" },
+				},
+			);
+		const res = await call("/oauth2/token", {
+			method: "POST",
+			headers: { "content-type": "application/x-www-form-urlencoded" },
+			body: "grant_type=refresh_token&refresh_token=rt&client_id=c1",
+		});
+		expect(res.headers.get("cache-control")).toBe("no-store, private");
+		expect(res.headers.get("pragma")).toBe("no-cache");
 	});
 
 	test("a client secret is never passed on to Arcade (the client is public)", async () => {
@@ -303,6 +346,124 @@ describe("mcp", () => {
 	});
 });
 
+describe("redirect allowlist", () => {
+	const seen: Request[] = [];
+	const strict = createShim({
+		publicUrl: PUBLIC,
+		gateway: "my-gateway",
+		allowedRedirectHosts: ["cb.test", "*.consent.azure-apim.net"],
+		log: () => {},
+		fetch: async (req) => {
+			seen.push(req);
+			return Response.json({ client_id: "new-client" }, { status: 201 });
+		},
+	});
+	beforeEach(() => {
+		seen.length = 0;
+	});
+	const register = (body: unknown) =>
+		strict(
+			new Request(`${PUBLIC}/oauth2/register`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			}),
+		);
+	const authorize = (query: Record<string, string>) =>
+		strict(
+			new Request(
+				`${PUBLIC}/oauth2/authorize?${new URLSearchParams({ client_id: "c1", ...query })}`,
+			),
+		);
+
+	test("matches exact hosts and *. wildcards, case-insensitively", () => {
+		const allowed = ["cb.test", "*.consent.azure-apim.net"];
+		expect(redirectHostAllowed("cb.test", allowed)).toBe(true);
+		expect(redirectHostAllowed("CB.TEST", allowed)).toBe(true);
+		expect(redirectHostAllowed("evil.cb.test", allowed)).toBe(false);
+		expect(redirectHostAllowed("cb.test.evil", allowed)).toBe(false);
+		expect(redirectHostAllowed("global.consent.azure-apim.net", allowed)).toBe(
+			true,
+		);
+		expect(redirectHostAllowed("a.b.consent.azure-apim.net", allowed)).toBe(
+			true,
+		);
+		// A wildcard doesn't match the apex, nor a longer suffix.
+		expect(redirectHostAllowed("consent.azure-apim.net", allowed)).toBe(false);
+		expect(redirectHostAllowed("evilconsent.azure-apim.net", allowed)).toBe(
+			false,
+		);
+	});
+
+	test("registration with allowed redirect_uris is forwarded unchanged", async () => {
+		const body = {
+			redirect_uris: [
+				"https://cb.test/r",
+				"https://global.consent.azure-apim.net/redirect/x",
+			],
+		};
+		const res = await register(body);
+		expect(res.status).toBe(201);
+		expect(await seen[0]?.text()).toBe(JSON.stringify(body));
+	});
+
+	test("registration with another host is refused before it reaches Arcade", async () => {
+		const res = await register({
+			redirect_uris: ["https://cb.test/r", "https://evil.test/r"],
+		});
+		expect(res.status).toBe(400);
+		expect(await res.json()).toEqual({
+			error: "redirect_uris host not allowed: evil.test",
+		});
+		expect(seen).toHaveLength(0);
+	});
+
+	test("registration with malformed redirect_uris is refused", async () => {
+		for (const redirect_uris of ["https://cb.test/r", [42], ["not a url"]]) {
+			const res = await register({ redirect_uris });
+			expect(res.status).toBe(400);
+		}
+		expect(seen).toHaveLength(0);
+	});
+
+	test("authorize with an allowed redirect_uri is passed on", async () => {
+		const res = await authorize({
+			redirect_uri: "https://global.consent.azure-apim.net/redirect/x",
+		});
+		expect(res.status).toBe(302);
+		const location = new URL(res.headers.get("location") ?? "");
+		expect(location.searchParams.get("redirect_uri")).toBe(
+			"https://global.consent.azure-apim.net/redirect/x",
+		);
+	});
+
+	test("authorize with another, or no, redirect_uri is refused", async () => {
+		const other = await authorize({ redirect_uri: "https://evil.test/r" });
+		expect(other.status).toBe(400);
+		expect(await other.json()).toEqual({
+			error: "redirect_uri host not allowed: evil.test",
+		});
+		const missing = await authorize({});
+		expect(missing.status).toBe(400);
+		expect(await missing.json()).toEqual({ error: "redirect_uri is required" });
+		expect(seen).toHaveLength(0);
+	});
+
+	test("without an allowlist, any redirect host is accepted", async () => {
+		reply = () => Response.json({ client_id: "new-client" }, { status: 201 });
+		const res = await call("/oauth2/register", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ redirect_uris: ["https://anywhere.test/r"] }),
+		});
+		expect(res.status).toBe(201);
+		const auth = await call(
+			"/oauth2/authorize?client_id=c1&redirect_uri=https%3A%2F%2Fanywhere.test%2Fr",
+		);
+		expect(auth.status).toBe(302);
+	});
+});
+
 describe("everything else", () => {
 	test("other gateways and paths are not proxied", async () => {
 		for (const path of ["/mcp/other-gateway", "/pre", "/oauth2/revoke", "/"]) {
@@ -407,6 +568,38 @@ describe("config", () => {
 		expect(() => configFromEnv({})).toThrow(
 			"missing required environment: SHIM_PUBLIC_URL, SHIM_GATEWAY",
 		);
+	});
+
+	test("requires an https public URL, except on localhost", () => {
+		for (const bad of ["http://mcp.example.com", "ftp://mcp.example.com"]) {
+			expect(() =>
+				configFromEnv({ SHIM_PUBLIC_URL: bad, SHIM_GATEWAY: "my-gateway" }),
+			).toThrow("SHIM_PUBLIC_URL must use https://");
+		}
+		expect(() =>
+			configFromEnv({ SHIM_PUBLIC_URL: "nope", SHIM_GATEWAY: "my-gateway" }),
+		).toThrow("SHIM_PUBLIC_URL must be a URL");
+		for (const local of ["http://localhost:8080", "http://127.0.0.1:8080"]) {
+			expect(
+				configFromEnv({ SHIM_PUBLIC_URL: local, SHIM_GATEWAY: "my-gateway" })
+					.publicUrl,
+			).toBe(local);
+		}
+	});
+
+	test("reads the redirect host allowlist as a comma-separated list", () => {
+		const env = { SHIM_PUBLIC_URL: PUBLIC, SHIM_GATEWAY: "my-gateway" };
+		expect(configFromEnv(env).allowedRedirectHosts).toBeUndefined();
+		expect(
+			configFromEnv({ ...env, SHIM_ALLOWED_REDIRECT_HOSTS: " " })
+				.allowedRedirectHosts,
+		).toBeUndefined();
+		expect(
+			configFromEnv({
+				...env,
+				SHIM_ALLOWED_REDIRECT_HOSTS: "cb.test, *.consent.azure-apim.net,",
+			}).allowedRedirectHosts,
+		).toEqual(["cb.test", "*.consent.azure-apim.net"]);
 	});
 
 	test("rejects a gateway slug that isn't one", () => {
