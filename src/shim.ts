@@ -37,6 +37,16 @@ export interface ShimConfig {
 	 * the `log` sink. Off by default: those bodies can hold user data.
 	 */
 	logBodies?: boolean | undefined;
+	/** Largest MCP request body, in bytes. Defaults to 10 MiB. */
+	maxBodyBytes?: number | undefined;
+	/** How long Arcade's OAuth endpoints get to answer. Defaults to 30 s. */
+	oauthTimeoutMs?: number | undefined;
+	/**
+	 * How long the gateway gets to start answering an MCP request (tool calls
+	 * can be slow). An event stream, once started, isn't cut off. Defaults to
+	 * 300 s.
+	 */
+	mcpTimeoutMs?: number | undefined;
 	/** Build identifier included in every log line. */
 	version?: string | undefined;
 	fetch?: ((req: Request) => Promise<Response>) | undefined;
@@ -88,29 +98,62 @@ export const USER_AGENT = "copilot-studio-mcp-shim";
 
 const GATEWAY_SLUG = /^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/i;
 
-const CREDENTIAL_HEADER = /authorization|cookie|token|secret|api-key|apikey/i;
+/**
+ * Request headers worth logging. An allowlist, because the hosts customers
+ * put in front of the shim add their own credential headers (API Management
+ * subscription keys, App Service sign-in tokens) under names no blocklist
+ * would anticipate.
+ */
+const LOGGABLE_HEADERS = new Set([
+	"accept",
+	"content-type",
+	"content-length",
+	"user-agent",
+	"mcp-protocol-version",
+	"traceparent",
+	"x-ms-client-request-id",
+	"x-ms-correlation-request-id",
+]);
 
 export function loggableHeaders(headers: Headers): Record<string, string> {
 	const out: Record<string, string> = {};
 	headers.forEach((value, name) => {
-		if (!CREDENTIAL_HEADER.test(name)) out[name] = value;
+		if (LOGGABLE_HEADERS.has(name.toLowerCase())) out[name] = value;
 	});
 	return out;
 }
 
-/** Hop-by-hop and framing headers; `fetch` sets its own. */
-const NO_FORWARD = new Set([
-	"host",
-	"connection",
-	"keep-alive",
-	"transfer-encoding",
-	"content-length",
-	"accept-encoding",
-	"te",
-	"trailer",
-	"upgrade",
-	"proxy-connection",
+/** Headers passed on to Arcade's OAuth endpoints. */
+const OAUTH_FORWARD = new Set(["accept", "content-type", "user-agent"]);
+
+/**
+ * Headers passed on to the gateway: the bearer token, content negotiation,
+ * and the MCP transport's own headers (`mcp-session-id`,
+ * `mcp-protocol-version`, and the like). `last-event-id` lets a client
+ * resume an event stream.
+ */
+const MCP_FORWARD = new Set([
+	"accept",
+	"authorization",
+	"content-type",
+	"last-event-id",
+	"user-agent",
 ]);
+
+function forwardHeaders(headers: Headers, to: "oauth" | "mcp"): Headers {
+	const out = new Headers();
+	headers.forEach((value, name) => {
+		const lower = name.toLowerCase();
+		const allowed =
+			to === "mcp"
+				? MCP_FORWARD.has(lower) || lower.startsWith("mcp-")
+				: OAUTH_FORWARD.has(lower);
+		if (allowed) out.set(name, value);
+	});
+	// Arcade sits behind Cloudflare, which blocks some default user agents.
+	if (!out.has("user-agent")) out.set("user-agent", USER_AGENT);
+	return out;
+}
 
 /** `fetch` decompresses, so the upstream encoding no longer applies. */
 const NO_RETURN = new Set([
@@ -121,14 +164,69 @@ const NO_RETURN = new Set([
 	"content-encoding",
 ]);
 
-function forwardHeaders(headers: Headers): Headers {
-	const out = new Headers();
-	headers.forEach((value, name) => {
-		if (!NO_FORWARD.has(name.toLowerCase())) out.set(name, value);
-	});
-	// Arcade sits behind Cloudflare, which blocks some default user agents.
-	if (!out.has("user-agent")) out.set("user-agent", USER_AGENT);
-	return out;
+/** Largest OAuth request body: registration metadata or a token form. */
+export const MAX_OAUTH_BODY_BYTES = 64 * 1024;
+
+export class ShimError extends Error {
+	constructor(
+		readonly status: number,
+		message: string,
+	) {
+		super(message);
+	}
+}
+
+/**
+ * The request body as text, refusing anything over `limit` bytes before
+ * reading it all into memory.
+ */
+export async function readBody(req: Request, limit: number): Promise<string> {
+	const declared = Number(req.headers.get("content-length"));
+	if (declared > limit) throw new ShimError(413, "request body too large");
+	if (!req.body) return "";
+	const reader = req.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let size = 0;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		size += value.byteLength;
+		if (size > limit) {
+			await reader.cancel();
+			throw new ShimError(413, "request body too large");
+		}
+		chunks.push(value);
+	}
+	const bytes = new Uint8Array(size);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return new TextDecoder().decode(bytes);
+}
+
+/**
+ * A signal that aborts when the client goes away, or when `ms` pass before
+ * `settle()` is called. Settle once response headers arrive, so a long
+ * event stream isn't cut off by the timeout.
+ */
+function deadline(client: AbortSignal | undefined, ms: number) {
+	const controller = new AbortController();
+	const timer = setTimeout(
+		() => controller.abort(new ShimError(504, "upstream timed out")),
+		ms,
+	);
+	const onClientAbort = () => controller.abort(client?.reason);
+	client?.addEventListener("abort", onClientAbort, { once: true });
+	return {
+		signal: controller.signal,
+		settle: () => clearTimeout(timer),
+		dispose: () => {
+			clearTimeout(timer);
+			client?.removeEventListener("abort", onClientAbort);
+		},
+	};
 }
 
 function decodeBase64Url(value: string): string {
@@ -283,6 +381,25 @@ export function createShim(config: ShimConfig) {
 	const upstreamFetch = config.fetch ?? ((req: Request) => fetch(req));
 	const log = config.log ?? consoleLog;
 	const logBodies = config.logBodies ?? false;
+	const maxBodyBytes = config.maxBodyBytes ?? 10 * 1024 * 1024;
+	const oauthTimeoutMs = config.oauthTimeoutMs ?? 30_000;
+	const mcpTimeoutMs = config.mcpTimeoutMs ?? 300_000;
+
+	/** An OAuth call to Arcade, read in full within the OAuth timeout. */
+	async function oauthFetch(
+		req: Request,
+		client: AbortSignal | undefined,
+	): Promise<{ res: Response; text: string }> {
+		const limit = deadline(client, oauthTimeoutMs);
+		try {
+			const res = await upstreamFetch(
+				new Request(req, { signal: limit.signal }),
+			);
+			return { res, text: await res.text() };
+		} finally {
+			limit.dispose();
+		}
+	}
 
 	const gatewayPath = `/mcp/${config.gateway}`;
 	const resource = `${arcadeApi}${gatewayPath}`;
@@ -335,14 +452,15 @@ export function createShim(config: ShimConfig) {
 				});
 
 			case "auth_metadata": {
-				const res = await upstreamFetch(
+				const { res, text } = await oauthFetch(
 					new Request(
 						`${arcadeAuth}/.well-known/oauth-authorization-server/oauth2`,
 						{ headers: { "user-agent": USER_AGENT } },
 					),
+					req.signal,
 				);
 				if (!res.ok) return json({ error: "upstream metadata" }, 502);
-				const meta = (await res.json()) as Record<string, unknown>;
+				const meta = parseJson(text);
 				return json({
 					...meta,
 					issuer: `${publicUrl}/oauth2`,
@@ -367,7 +485,9 @@ export function createShim(config: ShimConfig) {
 			}
 
 			case "token": {
-				const form = new URLSearchParams(await req.text());
+				const form = new URLSearchParams(
+					await readBody(req, MAX_OAUTH_BODY_BYTES),
+				);
 				form.set("resource", resource);
 				// Copilot's client is public (registered with no secret), but Power
 				// Platform's refresh template sends `client_secret` anyway, and some
@@ -378,16 +498,14 @@ export function createShim(config: ShimConfig) {
 					form.has("client_secret") ||
 					/^basic /i.test(req.headers.get("authorization") ?? "");
 				form.delete("client_secret");
-				const headers = forwardHeaders(req.headers);
-				headers.delete("authorization");
-				const res = await upstreamFetch(
+				const { res, text } = await oauthFetch(
 					new Request(`${arcadeAuth}/oauth2/token`, {
 						method: "POST",
-						headers,
+						headers: forwardHeaders(req.headers, "oauth"),
 						body: form,
 					}),
+					req.signal,
 				);
-				const text = await res.text();
 				const sent = Object.fromEntries(form);
 				const answer = parseJson(text);
 				entry.oauth = {
@@ -402,15 +520,15 @@ export function createShim(config: ShimConfig) {
 			}
 
 			case "register": {
-				const body = await req.text();
-				const res = await upstreamFetch(
+				const body = await readBody(req, MAX_OAUTH_BODY_BYTES);
+				const { res, text } = await oauthFetch(
 					new Request(`${arcadeAuth}/oauth2/register`, {
 						method: "POST",
-						headers: forwardHeaders(req.headers),
+						headers: forwardHeaders(req.headers, "oauth"),
 						body,
 					}),
+					req.signal,
 				);
-				const text = await res.text();
 				entry.oauth = {
 					request: pick(parseJson(body)),
 					response: pick(parseJson(text)),
@@ -422,7 +540,7 @@ export function createShim(config: ShimConfig) {
 				const body =
 					req.method === "GET" || req.method === "HEAD"
 						? undefined
-						: await req.text();
+						: await readBody(req, maxBodyBytes);
 				const session = req.headers.get("mcp-session-id");
 				const claims = tokenClaims(req.headers);
 				if (body) {
@@ -434,13 +552,22 @@ export function createShim(config: ShimConfig) {
 				if (session) entry.mcp_session_id = session;
 				if (claims) entry.token_claims = claims;
 
-				const res = await upstreamFetch(
-					new Request(resource, {
-						method: req.method,
-						headers: forwardHeaders(req.headers),
-						...(body === undefined ? {} : { body }),
-					}),
-				);
+				// The client-abort listener stays attached while the response
+				// streams, so a disconnect also closes the upstream stream.
+				const limit = deadline(req.signal, mcpTimeoutMs);
+				let res: Response;
+				try {
+					res = await upstreamFetch(
+						new Request(resource, {
+							method: req.method,
+							headers: forwardHeaders(req.headers, "mcp"),
+							signal: limit.signal,
+							...(body === undefined ? {} : { body }),
+						}),
+					);
+				} finally {
+					limit.settle();
+				}
 				const contentType = res.headers.get("content-type") ?? "";
 				// Server-sent events stream straight through, unread.
 				if (contentType.includes("text/event-stream") || !logBodies) {
@@ -487,8 +614,16 @@ export function createShim(config: ShimConfig) {
 		try {
 			res = await handle(req, kind, entry);
 		} catch (err) {
-			entry.error = String(err);
-			res = json({ error: "upstream unavailable" }, 502);
+			const reason =
+				err instanceof ShimError
+					? err
+					: err instanceof Error && err.cause instanceof ShimError
+						? err.cause
+						: undefined;
+			entry.error = String(reason ?? err);
+			res = reason
+				? json({ error: reason.message }, reason.status)
+				: json({ error: "upstream unavailable" }, 502);
 		}
 		if (kind !== "health") {
 			const pending = log({

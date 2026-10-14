@@ -1,7 +1,18 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { configFromEnv } from "./config.ts";
-import { attributes, MAX_VALUE_LENGTH, parseOtlpHeaders } from "./otlp.ts";
-import { createShim, type ShimLog, tokenClaims } from "./shim.ts";
+import {
+	attributes,
+	MAX_VALUE_LENGTH,
+	otlpLogBody,
+	parseOtlpHeaders,
+} from "./otlp.ts";
+import {
+	createShim,
+	MAX_OAUTH_BODY_BYTES,
+	readBody,
+	type ShimLog,
+	tokenClaims,
+} from "./shim.ts";
 
 const PUBLIC = "https://mcp.example.test";
 const RESOURCE = "https://api.arcade.dev/mcp/my-gateway";
@@ -447,5 +458,247 @@ describe("config", () => {
 			"dd-api-key": "abc",
 			"x-other": "a=b",
 		});
+	});
+});
+
+describe("headers", () => {
+	const customerCredentials = {
+		"ocp-apim-subscription-key": "apim-secret",
+		"x-functions-key": "functions-secret",
+		"x-ms-client-principal": "principal-secret",
+		"x-ms-token-aad-access-token": "aad-secret",
+		cookie: "session=cookie-secret",
+		"x-forwarded-for": "203.0.113.9",
+	};
+
+	test("only the bearer token and MCP headers reach the gateway", async () => {
+		await call("/mcp/my-gateway/", {
+			method: "POST",
+			headers: {
+				...customerCredentials,
+				authorization: `Bearer ${TOKEN}`,
+				"content-type": "application/json",
+				accept: "application/json, text/event-stream",
+				"mcp-session-id": "s-1",
+				"mcp-protocol-version": "2025-11-25",
+				"last-event-id": "e-7",
+			},
+			body: "{}",
+		});
+		expect([...(upstream[0]?.headers.keys() ?? [])].sort()).toEqual([
+			"accept",
+			"authorization",
+			"content-type",
+			"last-event-id",
+			"mcp-protocol-version",
+			"mcp-session-id",
+			"user-agent",
+		]);
+	});
+
+	test("OAuth calls carry no credentials but the form's own", async () => {
+		reply = () => Response.json({ access_token: "at" });
+		await call("/oauth2/token", {
+			method: "POST",
+			headers: {
+				...customerCredentials,
+				authorization: "Bearer something",
+				"content-type": "application/x-www-form-urlencoded",
+			},
+			body: "grant_type=refresh_token&refresh_token=rt&client_id=c1",
+		});
+		await call("/oauth2/register", {
+			method: "POST",
+			headers: { ...customerCredentials, "content-type": "application/json" },
+			body: "{}",
+		});
+		for (const req of upstream) {
+			expect([...req.headers.keys()].sort()).toEqual([
+				"content-type",
+				"user-agent",
+			]);
+		}
+	});
+
+	test("customer credential headers are never logged", async () => {
+		await call("/mcp/my-gateway", {
+			method: "POST",
+			headers: {
+				...customerCredentials,
+				authorization: `Bearer ${TOKEN}`,
+				"user-agent": "PowerPlatform",
+				"x-ms-client-request-id": "req-1",
+			},
+			body: "{}",
+		});
+		const exported = JSON.stringify(otlpLogBody(logs[0] as ShimLog, "s"));
+		for (const value of Object.values(customerCredentials)) {
+			expect(exported).not.toContain(value);
+		}
+		expect(logs[0]?.headers).toEqual({
+			"user-agent": "PowerPlatform",
+			"x-ms-client-request-id": "req-1",
+		});
+	});
+});
+
+describe("limits", () => {
+	test("an oversized OAuth body is refused before it reaches Arcade", async () => {
+		const res = await call("/oauth2/register", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ client_name: "x".repeat(MAX_OAUTH_BODY_BYTES) }),
+		});
+		expect(res.status).toBe(413);
+		expect(upstream).toHaveLength(0);
+	});
+
+	test("a declared length over the limit is refused without reading", async () => {
+		const res = await shim(
+			new Request(`${PUBLIC}/oauth2/token`, {
+				method: "POST",
+				headers: { "content-length": String(MAX_OAUTH_BODY_BYTES + 1) },
+				body: "grant_type=refresh_token",
+			}),
+		);
+		expect(res.status).toBe(413);
+	});
+
+	test("a streamed body is cut off at the limit", async () => {
+		const small = createShim({
+			publicUrl: PUBLIC,
+			gateway: "my-gateway",
+			maxBodyBytes: 1024,
+			log: () => {},
+			fetch: async () => Response.json({}),
+		});
+		let pulls = 0;
+		const body = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				pulls++;
+				controller.enqueue(new Uint8Array(512));
+				if (pulls > 100) controller.close();
+			},
+		});
+		const res = await small(
+			new Request(`${PUBLIC}/mcp/my-gateway`, {
+				method: "POST",
+				body,
+				duplex: "half",
+			} as RequestInit),
+		);
+		expect(res.status).toBe(413);
+		expect(pulls).toBeLessThan(10);
+	});
+
+	test("readBody returns small bodies whole", async () => {
+		const text = await readBody(
+			new Request(PUBLIC, { method: "POST", body: "héllo" }),
+			100,
+		);
+		expect(text).toBe("héllo");
+	});
+});
+
+describe("timeouts", () => {
+	/** An upstream that never answers, and records the abort. */
+	const hanging = (aborted: unknown[]) => (req: Request) =>
+		new Promise<Response>((_, reject) => {
+			req.signal.addEventListener("abort", () => {
+				aborted.push(req.signal.reason);
+				reject(req.signal.reason);
+			});
+		});
+
+	test("a slow OAuth endpoint is a 504", async () => {
+		const aborted: unknown[] = [];
+		const slow = createShim({
+			publicUrl: PUBLIC,
+			gateway: "my-gateway",
+			oauthTimeoutMs: 20,
+			log: () => {},
+			fetch: hanging(aborted),
+		});
+		const res = await slow(
+			new Request(`${PUBLIC}/oauth2/token`, { method: "POST", body: "" }),
+		);
+		expect(res.status).toBe(504);
+		expect(aborted).toHaveLength(1);
+	});
+
+	test("a gateway that never starts answering is a 504", async () => {
+		const slow = createShim({
+			publicUrl: PUBLIC,
+			gateway: "my-gateway",
+			mcpTimeoutMs: 20,
+			log: () => {},
+			fetch: hanging([]),
+		});
+		const res = await slow(
+			new Request(`${PUBLIC}/mcp/my-gateway`, { method: "POST", body: "{}" }),
+		);
+		expect(res.status).toBe(504);
+	});
+
+	test("an event stream outlives the timeout once it has started", async () => {
+		let upstreamSignal: AbortSignal | undefined;
+		const streaming = createShim({
+			publicUrl: PUBLIC,
+			gateway: "my-gateway",
+			mcpTimeoutMs: 20,
+			log: () => {},
+			fetch: async (req) => {
+				upstreamSignal = req.signal;
+				const encoder = new TextEncoder();
+				return new Response(
+					new ReadableStream({
+						async start(controller) {
+							controller.enqueue(encoder.encode("data: 1\n\n"));
+							await Bun.sleep(60);
+							controller.enqueue(encoder.encode("data: 2\n\n"));
+							controller.close();
+						},
+					}),
+					{ headers: { "content-type": "text/event-stream" } },
+				);
+			},
+		});
+		const res = await streaming(
+			new Request(`${PUBLIC}/mcp/my-gateway`, { method: "GET" }),
+		);
+		expect(await res.text()).toBe("data: 1\n\ndata: 2\n\n");
+		expect(upstreamSignal?.aborted).toBe(false);
+	});
+
+	test("a client that goes away aborts the upstream call", async () => {
+		const aborted: unknown[] = [];
+		const slow = createShim({
+			publicUrl: PUBLIC,
+			gateway: "my-gateway",
+			log: () => {},
+			fetch: hanging(aborted),
+		});
+		const client = new AbortController();
+		const pending = slow(
+			new Request(`${PUBLIC}/mcp/my-gateway`, {
+				method: "POST",
+				body: "{}",
+				signal: client.signal,
+			}),
+		);
+		await Bun.sleep(5);
+		client.abort();
+		await pending;
+		expect(aborted).toHaveLength(1);
+	});
+
+	test("timeouts and limits must be positive integers", () => {
+		expect(() =>
+			configFromEnv({
+				SHIM_PUBLIC_URL: PUBLIC,
+				SHIM_GATEWAY: "my-gateway",
+				SHIM_MCP_TIMEOUT_MS: "soon",
+			}),
+		).toThrow("SHIM_MCP_TIMEOUT_MS must be a positive integer");
 	});
 });

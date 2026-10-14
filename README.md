@@ -46,14 +46,16 @@ Copilot Studio ──▶ shim (your domain) ──▶ Arcade OAuth  (resource pi
 
 The shim is a TLS-terminating reverse proxy, so it sees OAuth codes and tokens in transit, the same way any load balancer or API gateway in front of a service does. Within that:
 
+- **Run it yourself.** Arcade doesn't operate this shim. Host it in your own tenant or cloud subscription, on a domain you control, over HTTPS, so the tokens passing through it and its logs stay inside your environment. Run one shim per gateway.
 - **It stores nothing.** No database, no cache, no session state. Every request is handled and forgotten.
-- **It never logs a credential.** Authorization headers, cookies, codes, verifiers, client secrets, and access and refresh tokens are never written to logs. Token requests log only *whether* each credential was present (`has_refresh_token: true`), which is what you need to debug a stale connection.
+- **It forwards only what Arcade needs.** Headers are passed on from an allowlist: the bearer token and MCP's own headers to the gateway, and only `content-type`, `accept`, and the user agent to Arcade's OAuth endpoints. Anything your own infrastructure adds in front of the shim, such as an API Management subscription key, App Service sign-in headers, or cookies, never reaches Arcade.
+- **It never logs a credential.** Logged request headers come from a short allowlist (user agent, content type, MCP protocol version, and trace and correlation IDs), so bearer tokens, cookies, and any credential headers your infrastructure adds are left out. Codes, verifiers, client secrets, and access and refresh tokens are never written to logs either. Token requests log only *whether* each credential was present (`has_refresh_token: true`), which is what you need to debug a stale connection.
 - **It doesn't log tool data by default.** MCP request and response bodies (tool arguments and results) are only logged if you set `SHIM_LOG_BODIES=true`.
-- **It can't widen access.** It pins `resource` to one gateway, so a client registered through it can only get tokens for that gateway, and Arcade still enforces the gateway's user source, access rules, and authorization exactly as it would without the shim. The shim holds no Arcade API key and has no privileges of its own.
-- **Registration is unchanged.** Dynamic Client Registration is forwarded as-is; it's open on Arcade too, as the MCP spec expects.
+- **It only reaches your gateway.** It pins `resource` to one gateway, so a client registered through it can only get tokens for that gateway, and Arcade still enforces the gateway's user source, access rules, and authorization exactly as it would without the shim. The shim holds no Arcade API key and has no privileges of its own.
+- **It asks for refresh tokens.** The shim adds the `offline_access` scope to every sign-in, so Copilot gets a refresh token and connections don't go stale when the first access token expires. That means each connection holds a longer-lived credential than an access token alone. Revoking a user's authorization in Arcade cuts it off.
+- **Registration is unchanged.** Dynamic Client Registration is forwarded as-is; it's open on Arcade too, as the MCP spec expects. Because registration is open, anyone can create a client and send your users a sign-in link on your shim's domain. Arcade's consent page names the client asking for access, and users should only approve clients they recognize.
 - **Client secrets are dropped.** Copilot registers a public client, but Power Platform's refresh request sends an empty `client_secret` (or Basic auth) anyway, which Arcade would refuse for a public client. The shim removes it before forwarding.
-
-Run one shim per gateway, on a domain you control, over HTTPS.
+- **Requests are bounded.** OAuth request bodies are capped at 64 KiB and MCP bodies at 10 MiB (`SHIM_MAX_BODY_BYTES`), refused with `413` before they're read into memory. Arcade's OAuth endpoints get 30 seconds to answer and the gateway 300 seconds to start answering, after which the shim returns `504`. A client that disconnects cancels the call to Arcade. The Node and Docker builds also close connections whose request takes more than 30 seconds to arrive; response streams aren't affected.
 
 ## Deploy
 
@@ -106,13 +108,16 @@ npx wrangler deploy
 | `ARCADE_API_URL`              | no       | `https://api.arcade.dev`   | Arcade's MCP API. Change it for a self-hosted Arcade.                                                         |
 | `ARCADE_AUTH_URL`             | no       | `https://cloud.arcade.dev` | Arcade's OAuth server. Change it for a self-hosted Arcade.                                                    |
 | `SHIM_LOG_BODIES`             | no       | `false`                    | Also log MCP request and response bodies to the OTLP sink. These can hold user data.                          |
+| `SHIM_MAX_BODY_BYTES`         | no       | `10485760` (10 MiB)        | Largest MCP request body accepted. OAuth bodies are always capped at 64 KiB.                                  |
+| `SHIM_OAUTH_TIMEOUT_MS`       | no       | `30000`                    | How long Arcade's OAuth endpoints get to answer before the shim returns `504`.                                |
+| `SHIM_MCP_TIMEOUT_MS`         | no       | `300000`                   | How long the gateway gets to start answering an MCP request. Event streams, once started, aren't cut off.     |
 | `PORT`                        | no       | `8080`                     | Listen port (Docker, Node, Bun).                                                                              |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | no       |                            | Send each request as an OTLP/HTTP JSON log record to this collector, e.g. `http://otel-collector:4318`.       |
 | `OTEL_EXPORTER_OTLP_HEADERS`  | no       |                            | Headers for the OTLP endpoint, as `key=value,key2=value2`.                                                    |
 | `OTEL_SERVICE_NAME`           | no       | `copilot-studio-mcp-shim`  | `service.name` on exported logs.                                                                              |
 | `SHIM_VERSION`                | no       | detected                   | Build identifier on every log line. Detected from Vercel, Render, and common CI variables when not set.       |
 
-Every request (except `/health`) is logged to stdout as one JSON line with `event: "mcp_shim_request"`, the route, status, timing, the MCP method and tool name, and the token's non-secret claims (`iss`, `aud`, `sub`, `client_id`, `scope`, `exp`).
+Every request (except `/health`) is logged to stdout as one JSON line with `event: "mcp_shim_request"`, the route, status, timing, the MCP method and tool name, and a few claims from the bearer token (`iss`, `aud`, `sub`, `client_id`, `scope`, `exp`). The shim reads those claims without verifying the token, so treat them as what the caller presented, not as proof of identity; Arcade verifies the token, and the logged `status` says whether it accepted it.
 
 ## Connect Copilot Studio
 

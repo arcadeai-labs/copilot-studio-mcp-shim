@@ -17,6 +17,18 @@ function detectVersion(env: Env): string | undefined {
 	);
 }
 
+function positiveInt(env: Env, name: string): number | undefined {
+	const raw = env[name];
+	if (raw === undefined || raw === "") return undefined;
+	const value = Number(raw);
+	if (!Number.isInteger(value) || value <= 0) {
+		throw new Error(
+			`${name} must be a positive integer, got ${JSON.stringify(raw)}`,
+		);
+	}
+	return value;
+}
+
 /** Shim settings from environment variables. See the README for each one. */
 export function configFromEnv(env: Env): ShimConfig {
 	const publicUrl = env.SHIM_PUBLIC_URL;
@@ -35,6 +47,9 @@ export function configFromEnv(env: Env): ShimConfig {
 		arcadeApiUrl: env.ARCADE_API_URL,
 		arcadeAuthUrl: env.ARCADE_AUTH_URL,
 		logBodies: TRUE.has((env.SHIM_LOG_BODIES ?? "").toLowerCase()),
+		maxBodyBytes: positiveInt(env, "SHIM_MAX_BODY_BYTES"),
+		oauthTimeoutMs: positiveInt(env, "SHIM_OAUTH_TIMEOUT_MS"),
+		mcpTimeoutMs: positiveInt(env, "SHIM_MCP_TIMEOUT_MS"),
 		version: detectVersion(env),
 		...(endpoint
 			? {
